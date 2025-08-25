@@ -1,0 +1,50 @@
+import cv2
+
+def crop_vertical_only(image):
+    h, w = image.shape[:2]
+    
+    # Red line percentages from your annotated image
+    y1 = int(h * 0.5208)  # ≈ 800px
+    y2 = int(h * 0.6771)  # ≈ 1040px
+    
+    # Full width preserved - NO horizontal cropping
+    cropped = image[y1:y2, 0:w]  # Start x=0, End x=w (full width)
+    
+    # Print dimensions to verify
+    print(f"Original: {h}x{w}")
+    print(f"Cropped: {cropped.shape[0]}x{cropped.shape[1]}")
+    print(f"Width preserved: {w == cropped.shape[1]}")
+    
+    return cropped
+
+# -------- Main Test Block --------
+if __name__ == "__main__":
+    image = cv2.imread("C:\\Users\\ADMIN\\Pictures\\Camera Roll\\WIN_20250605_12_42_36_Pro.jpg")
+    
+    if image is None:
+        print("Image not found!")
+    else:
+        cropped = crop_vertical_only(image)
+        
+        # Option 1: Let OpenCV auto-size the window (may be very wide)
+        cv2.namedWindow("Vertical Only Crop", cv2.WINDOW_NORMAL)
+        
+        # Option 2: Set window to actual image dimensions (uncomment if needed)
+        # cv2.resizeWindow("Vertical Only Crop", cropped.shape[1], cropped.shape[0])
+        
+        # Option 3: Scale up the height to make characters more readable
+        display_scale = 3  # Make image 3x taller for better readability
+        display_height = cropped.shape[0] * display_scale
+        display_width = cropped.shape[1]
+        
+        # Resize for display only (doesn't affect saved file)
+        display_image = cv2.resize(cropped, (display_width, display_height), 
+                                 interpolation=cv2.INTER_CUBIC)
+        
+        cv2.imshow("Vertical Only Crop", display_image)
+        print(f"Display scaled {display_scale}x taller for readability")
+        cv2.imwrite("final_vertical_crop.jpg", cropped)
+        
+        print("Press any key to close...")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
