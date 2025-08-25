@@ -1,0 +1,86 @@
+import cv2
+import numpy as np
+
+def stitch_images_simple_overlap(img1, img2, mm_per_pixel_1, mm_per_pixel_2, overlap_mm, show_debug=False):
+    """
+    Stitch two images by removing a known overlap amount.
+    
+    Args:
+        img1: Left image (from camera 1)
+        img2: Right image (from camera 2)  
+        mm_per_pixel_1: mm per pixel ratio for camera 1
+        mm_per_pixel_2: mm per pixel ratio for camera 2
+        overlap_mm: The actual overlap distance in millimeters
+        show_debug: Show debug information
+    
+    Returns:
+        stitched_img: The stitched image (numpy array)
+        total_width_mm: Total width of stitched image in millimeters
+    """
+    
+    # Convert overlap from mm to pixels for camera 2 (we'll crop from the left side of img2)
+    overlap_px_cam2 = int(overlap_mm / mm_per_pixel_2)
+    
+    # Remove the overlap from the left side of img2
+    cropped_img2 = img2[:, overlap_px_cam2:]
+    
+    # Stitch images side by side
+    stitched_img = np.hstack((img1, cropped_img2))
+    
+    # Calculate total width in mm
+    width_mm_1 = img1.shape[1] * mm_per_pixel_1
+    width_mm_2_cropped = cropped_img2.shape[1] * mm_per_pixel_2
+    total_width_mm = width_mm_1 + width_mm_2_cropped
+    
+    if show_debug:
+        print(f"Overlap to remove: {overlap_mm} mm ({overlap_px_cam2} px from img2)")
+        print(f"Original img1 width: {img1.shape[1]} px ({width_mm_1:.2f} mm)")
+        print(f"Original img2 width: {img2.shape[1]} px ({img2.shape[1] * mm_per_pixel_2:.2f} mm)")
+        print(f"Cropped img2 width: {cropped_img2.shape[1]} px ({width_mm_2_cropped:.2f} mm)")
+        print(f"Total stitched width: {total_width_mm:.2f} mm")
+        print(f"Stitched image shape: {stitched_img.shape}")
+        
+        cv2.imshow("Original Image 1", img1)
+        cv2.imshow("Original Image 2", img2)
+        cv2.imshow("Cropped Image 2", cropped_img2)
+        cv2.imshow("Stitched Image", stitched_img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    
+    return stitched_img, total_width_mm
+
+# Alternative version if you want to crop from img1 instead:
+def stitch_images_crop_right(img1, img2, mm_per_pixel_1, mm_per_pixel_2, overlap_mm, show_debug=False):
+    """
+    Same as above but crops overlap from the right side of img1 instead of left side of img2
+    """
+    # Convert overlap from mm to pixels for camera 1 
+    overlap_px_cam1 = int(overlap_mm / mm_per_pixel_1)
+    
+    # Remove the overlap from the right side of img1
+    cropped_img1 = img1[:, :-overlap_px_cam1] if overlap_px_cam1 > 0 else img1
+    
+    # Stitch images side by side
+    stitched_img = np.hstack((cropped_img1, img2))
+    
+    # Calculate total width in mm
+    width_mm_1_cropped = cropped_img1.shape[1] * mm_per_pixel_1
+    width_mm_2 = img2.shape[1] * mm_per_pixel_2
+    total_width_mm = width_mm_1_cropped + width_mm_2
+    
+    if show_debug:
+        print(f"Overlap removed: {overlap_mm} mm ({overlap_px_cam1} px from img1)")
+        print(f"Total stitched width: {total_width_mm:.2f} mm")
+    
+    return stitched_img, total_width_mm
+
+# Example usage:
+# img1 = cv2.imread('camera1.jpg')  # Left camera
+# img2 = cv2.imread('camera2.jpg')  # Right camera
+# mm_per_pixel_1 = 0.5  # Camera 1 calibration
+# mm_per_pixel_2 = 0.45  # Camera 2 calibration
+# overlap_mm = 100  # Known 100mm overlap
+
+# stitched_img, total_width = stitch_images_simple_overlap(
+#     img1, img2, mm_per_pixel_1, mm_per_pixel_2, overlap_mm, show_debug=True)
+# print(f"Total fabric width: {total_width:.2f} mm")
