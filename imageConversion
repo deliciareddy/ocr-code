@@ -1,0 +1,329 @@
+import sys
+import os
+import cv2
+import numpy as np
+import sqlite3
+import threading
+from datetime import datetime
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QVBoxLayout, 
+                           QHBoxLayout, QLabel, QPushButton, QTableWidget, 
+                           QTableWidgetItem, QHeaderView, QAbstractItemView,
+                           QMessageBox, QWidget, QSlider, QFrame, QGridLayout,
+                           QInputDialog)
+from PyQt5.QtCore import Qt, QSize, QTimer
+from PyQt5 import QtGui, QtCore
+
+# ==================== CONFIGURATION ====================
+DB_NAME = "fidas_data.db"
+CAMERA_RESOLUTION = (2592, 1944)  # 5MP resolution
+
+# ==================== IMAGE PROCESSING ====================
+def preprocess_image(img):
+    """Convert to grayscale and apply Gaussian blur"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.GaussianBlur(gray, (3, 3), 0)
+
+def detect_fabric_edges(img, base_img):
+    """
+    Detect fabric edges using background subtraction
+    Returns: (width_pixels, output_image_with_markers)
+    """
+    # Background subtraction
+    diff = cv2.absdiff(preprocess_image(base_img), preprocess_image(img))
+    _, thresh = cv2.threshold(diff, 125, 255, cv2.THRESH_BINARY)
+    
+    # Find contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0, img
+    
+    # Find largest contour
+    cnt = max(contours, key=cv2.contourArea)
+    
+    # Get rotated bounding box
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect)
+    box = np.intp(box)
+    
+    # Draw on original image
+    output_img = img.copy()
+    cv2.polylines(output_img, [box], True, (255, 0, 0), 3)
+    
+    # Draw center line
+    (x, y), (w, h), angle = rect
+    if w < h:
+        angle += 90
+    rad = np.deg2rad(angle)
+    length = max(w, h)/2
+    x1 = int(x - np.cos(rad) * length)
+    y1 = int(y - np.sin(rad) * length)
+    x2 = int(x + np.cos(rad) * length)
+    y2 = int(y + np.sin(rad) * length)
+    cv2.line(output_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+    
+    return max(w, h), output_img
+
+# ==================== DATABASE ====================
+class DatabaseManager:
+    def __init__(self):
+        self.init_db()
+    
+    def init_db(self):
+        with sqlite3.connect(DB_NAME) as conn:
+            # Create tables (same as your original schema)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    width_mm REAL,
+                    timestamp TEXT
+                )
+            ''')
+            conn.commit()
+    
+    def save_measurement(self, width):
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute('''
+                INSERT INTO measurements (width_mm, timestamp)
+                VALUES (?, ?)
+            ''', (width, datetime.now().isoformat()))
+            conn.commit()
+    
+    def get_measurements(self):
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.execute('SELECT * FROM measurements ORDER BY timestamp DESC')
+            return cursor.fetchall()
+
+# ==================== CAMERA THREAD ====================
+class CameraThread(threading.Thread):
+    def __init__(self, cam_id):
+        super().__init__()
+        self.cam_id = cam_id
+        self.frame = None
+        self.running = True
+        self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION[1])
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -10)
+    
+    def run(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame = frame
+    
+    def stop(self):
+        self.running = False
+        self.cap.release()
+
+# ==================== MAIN CONTROLLER ====================
+class MeasurementController:
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.cam_left = None
+        self.cam_right = None
+        self.base_img_left = None
+        self.base_img_right = None
+        
+    def init_cameras(self):
+        try:
+            self.cam_left = CameraThread(0)
+            self.cam_right = CameraThread(2)
+            self.cam_left.start()
+            self.cam_right.start()
+            return True
+        except Exception as e:
+            print(f"Camera error: {e}")
+            return False
+    
+    def capture_base_images(self):
+        if self.cam_left and self.cam_right:
+            self.base_img_left = self.cam_left.frame.copy()
+            self.base_img_right = self.cam_right.frame.copy()
+            cv2.imwrite("base_left.png", self.base_img_left)
+            cv2.imwrite("base_right.png", self.base_img_right)
+            return True
+        return False
+    
+    def measure_width(self):
+        if not self.base_img_left or not self.base_img_right:
+            return None, "No base images captured"
+        
+        try:
+            # Process left camera
+            left_frame = self.cam_left.frame.copy()
+            width_left, _ = detect_fabric_edges(left_frame, self.base_img_left)
+            
+            # Process right camera
+            right_frame = self.cam_right.frame.copy()
+            width_right, _ = detect_fabric_edges(right_frame, self.base_img_right)
+            
+            # Convert to mm using calibration
+            with open('calibration.txt') as f:
+                px_per_mm = float(f.read())
+            
+            total_mm = (width_left + width_right) / px_per_mm
+            self.db.save_measurement(total_mm)
+            
+            return total_mm, None
+        except Exception as e:
+            return None, str(e)
+
+# ==================== UI COMPONENTS ====================
+class MainMenu(QWidget):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        
+        # Title
+        title = QLabel("FIDAS WIDTH MEASUREMENT")
+        title.setStyleSheet("font-size: 24px; color: #567BDF; font-weight: bold;")
+        layout.addWidget(title, alignment=Qt.AlignCenter)
+        
+        # Version
+        version = QLabel("Version: v1.0.0")
+        version.setStyleSheet("color: #B3B3B3;")
+        layout.addWidget(version, alignment=Qt.AlignCenter)
+        
+        # Buttons grid (3x3 + full width bottom)
+        grid = QGridLayout()
+        grid.setSpacing(15)
+        
+        buttons = [
+            ("CROP SETTINGS", "#567BDF", 0, 0),
+            ("LEFT EDGE", "#9E0B60", 0, 1), 
+            ("RIGHT EDGE", "#06B595", 0, 2),
+            ("LEFT CAM CAL", "#DC3232", 1, 0),
+            ("RIGHT CAM CAL", "#FFA500", 1, 1),
+            ("CENTER CAL", "#8A2BE2", 1, 2),
+            ("OVERLAP STITCHING", "#00BFFF", 2, 0),
+            ("EXPOSURE SETTINGS", "#3CB371", 2, 1),
+            ("SAVE BASE IMAGE", "#DB7093", 2, 2),
+            ("VIEW DATABASE", "#6A5ACD", 3, 0, 1, 3)
+        ]
+        
+        for text, color, row, col, *span in buttons:
+            btn = QPushButton(text)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {color};
+                    color: white;
+                    border-radius: 5px;
+                    padding: 10px;
+                    font-weight: bold;
+                    min-width: 150px;
+                }}
+                QPushButton:hover {{ background: rgba{color[3:-1]}, 0.8); }}
+            """)
+            
+            # Connect buttons
+            if text == "CROP SETTINGS":
+                btn.clicked.connect(self.parent.show_crop_settings)
+            elif text == "SAVE BASE IMAGE":
+                btn.clicked.connect(self.parent.capture_base_images)
+            elif text == "VIEW DATABASE":
+                btn.clicked.connect(self.parent.show_database)
+            # ... connect other buttons similarly
+            
+            grid.addWidget(btn, row, col, *span if span else [1,1])
+        
+        layout.addLayout(grid)
+        self.setLayout(layout)
+
+class MeasurementScreen(QWidget):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        
+        # Camera feed display
+        self.camera_display = QLabel()
+        self.camera_display.setMinimumSize(800, 600)
+        self.camera_display.setStyleSheet("background: #333; border: 2px solid #567BDF;")
+        layout.addWidget(self.camera_display)
+        
+        # Measurement button
+        self.measure_btn = QPushButton("MEASURE WIDTH")
+        self.measure_btn.setStyleSheet("""
+            background: #06B595; 
+            color: white; 
+            padding: 15px;
+            font-weight: bold;
+        """)
+        self.measure_btn.clicked.connect(self.parent.measure_width)
+        layout.addWidget(self.measure_btn)
+        
+        self.setLayout(layout)
+
+# ==================== MAIN WINDOW ====================
+class FidasApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.controller = MeasurementController()
+        self.init_ui()
+        
+        if not self.controller.init_cameras():
+            QMessageBox.critical(self, "Error", "Failed to initialize cameras")
+    
+    def init_ui(self):
+        self.setWindowTitle("FIDAS Fabric Measurement")
+        self.setGeometry(100, 100, 1024, 768)
+        
+        # Dark theme
+        self.setStyleSheet("""
+            QMainWindow { background: #2D3233; }
+            QLabel { color: #B3B3B3; }
+        """)
+        
+        # Stacked widgets for multi-screen
+        self.stack = QStackedWidget()
+        
+        # Create screens
+        self.main_menu = MainMenu(self)
+        self.measure_screen = MeasurementScreen(self)
+        
+        # Add to stack
+        self.stack.addWidget(self.main_menu)
+        self.stack.addWidget(self.measure_screen)
+        
+        self.setCentralWidget(self.stack)
+    
+    def capture_base_images(self):
+        if self.controller.capture_base_images():
+            QMessageBox.information(self, "Success", "Base images captured")
+        else:
+            QMessageBox.warning(self, "Error", "Failed to capture base images")
+    
+    def measure_width(self):
+        width, error = self.controller.measure_width()
+        if error:
+            QMessageBox.critical(self, "Error", error)
+        else:
+            QMessageBox.information(self, "Result", f"Fabric width: {width:.2f}mm")
+    
+    def show_database(self):
+        # Implement database view
+        pass
+    
+    def closeEvent(self, event):
+        self.controller.cam_left.stop()
+        self.controller.cam_right.stop()
+        event.accept()
+
+# ==================== APPLICATION START ====================
+if __name__ == "__main__":
+    # Create calibration file if missing
+    if not os.path.exists('calibration.txt'):
+        with open('calibration.txt', 'w') as f:
+            f.write("10.0")  # Default: 10 pixels per mm
+    
+    app = QApplication(sys.argv)
+    window = FidasApp()
+    window.show()
+    sys.exit(app.exec_())
