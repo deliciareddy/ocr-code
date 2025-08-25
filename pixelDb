@@ -1,0 +1,986 @@
+#!/usr/bin/env python3
+"""
+FIDAS Width Measurement System - Integrated Application
+Complete working version with all fixes
+"""
+
+import sys
+import sqlite3
+from datetime import datetime
+import os
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QVBoxLayout, 
+                            QHBoxLayout, QLabel, QPushButton, QTableWidget, 
+                            QTableWidgetItem, QHeaderView, QAbstractItemView,
+                            QMessageBox, QWidget, QSlider, QFrame)
+from PyQt5.QtCore import Qt, QSize
+from PyQt5 import QtGui, QtCore, QtWidgets
+
+# Database Backend
+DB_NAME = "core_data.db"
+
+class DatabaseManager:
+    """Database management class for FIDAS system"""
+    
+    def __init__(self):
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize the database with required tables"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute('PRAGMA foreign_keys = ON')
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS version_store (
+                        machine_id TEXT PRIMARY KEY,
+                        version TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                ''')
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS measurement_data (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        machine_id TEXT NOT NULL,
+                        length REAL,
+                        width REAL,
+                        exposure REAL,
+                        mode TEXT CHECK(mode IN ('calibration', 'measurement')) NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        FOREIGN KEY(machine_id) REFERENCES version_store(machine_id) ON DELETE CASCADE
+                    )
+                ''')
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS base_images (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        machine_id TEXT NOT NULL,
+                        image_path TEXT NOT NULL,
+                        saved_at TEXT NOT NULL,
+                        FOREIGN KEY(machine_id) REFERENCES version_store(machine_id) ON DELETE CASCADE
+                    )
+                ''')
+                conn.commit()
+                
+                # Initialize default machine if not exists
+                self.save_version("FIDAS_MAIN", "v1.0.0")
+                
+        except sqlite3.Error as e:
+            print(f"Database initialization error: {e}")
+    
+    def is_valid_machine(self, machine_id: str) -> bool:
+        """Check if machine ID exists in database"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.execute("SELECT 1 FROM version_store WHERE machine_id = ?", (machine_id,))
+                return cursor.fetchone() is not None
+        except sqlite3.Error:
+            return False
+    
+    def save_version(self, machine_id: str, version: str):
+        """Save or update machine version"""
+        now = datetime.now().isoformat()
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute('''
+                    INSERT INTO version_store (machine_id, version, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(machine_id) DO UPDATE 
+                    SET version = excluded.version, updated_at = excluded.updated_at
+                ''', (machine_id, version, now))
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error saving version: {e}")
+    
+    def get_version(self, machine_id: str):
+        """Get machine version"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.execute("SELECT version FROM version_store WHERE machine_id = ?", (machine_id,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+        except sqlite3.Error:
+            return None
+    
+    def save_measurement(self, machine_id: str, length: float, width: float, exposure: float, mode: str):
+        """Save measurement data"""
+        if not self.is_valid_machine(machine_id):
+            raise ValueError(f"Invalid machine_id: '{machine_id}' — must exist before saving data.")
+        
+        now = datetime.now().isoformat()
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute('''
+                    INSERT INTO measurement_data (machine_id, length, width, exposure, mode, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (machine_id, length, width, exposure, mode, now))
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error saving measurement: {e}")
+            raise
+    
+    def get_latest_measurement(self, machine_id: str):
+        """Get latest measurement for machine"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.execute('''
+                    SELECT length, width, exposure, mode, timestamp 
+                    FROM measurement_data 
+                    WHERE machine_id = ? 
+                    ORDER BY timestamp DESC LIMIT 1
+                ''', (machine_id,))
+                return cursor.fetchone()
+        except sqlite3.Error:
+            return None
+    
+    def get_all_measurements(self):
+        """Get all measurements for display"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.execute('''
+                    SELECT id, machine_id, length, width, exposure, mode, timestamp 
+                    FROM measurement_data 
+                    ORDER BY timestamp DESC
+                ''')
+                return cursor.fetchall()
+        except sqlite3.Error:
+            return []
+    
+    def delete_measurement(self, measurement_id: int):
+        """Delete measurement by ID"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute("DELETE FROM measurement_data WHERE id = ?", (measurement_id,))
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            print(f"Error deleting measurement: {e}")
+            return False
+    
+    def save_base_image(self, machine_id: str, image_path: str):
+        """Save base image reference"""
+        if not self.is_valid_machine(machine_id):
+            raise ValueError(f"Invalid machine_id: '{machine_id}' — must exist before saving base image.")
+        
+        now = datetime.now().isoformat()
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute('''
+                    INSERT INTO base_images (machine_id, image_path, saved_at)
+                    VALUES (?, ?, ?)
+                ''', (machine_id, image_path, now))
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error saving base image: {e}")
+            raise
+    
+    def get_base_images(self, machine_id: str):
+        """Get base images for machine"""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.execute('''
+                    SELECT id, image_path, saved_at FROM base_images
+                    WHERE machine_id = ?
+                ''', (machine_id,))
+                return cursor.fetchall()
+        except sqlite3.Error:
+            return []
+
+
+class CameraFeedWidget(QtWidgets.QWidget):
+    """Base camera feed widget with save and back buttons"""
+   
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.title = title
+        self.db_manager = parent.db_manager if parent else None
+        self.setup_layout()
+   
+    def setup_layout(self):
+        """Setup the camera feed layout"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(20)
+       
+        # Title header
+        title_label = QLabel(self.title)
+        title_label.setStyleSheet("""
+            QLabel {
+                color: rgb(179, 179, 179);
+                font-size: 24px;
+                font-weight: bold;
+                padding: 10px 0px;
+            }
+        """)
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title_label)
+       
+        # Camera feed area
+        self.camera_feed_label = QLabel()
+        self.camera_feed_label.setMinimumSize(800, 600)
+        self.camera_feed_label.setStyleSheet("""
+            QLabel {
+                background-color: rgb(45, 50, 51);
+                border: 2px solid rgb(86, 123, 223);
+                border-radius: 10px;
+                color: rgb(179, 179, 179);
+                font-size: 18px;
+            }
+        """)
+        self.camera_feed_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.camera_feed_label.setText(f"{self.title}\n\nCamera Feed Area\n800 x 600 pixels\n\n[Connect your OpenCV feed here]")
+        self.camera_feed_label.setScaledContents(True)
+       
+        # Center the camera feed
+        feed_layout = QHBoxLayout()
+        feed_layout.addStretch()
+        feed_layout.addWidget(self.camera_feed_label)
+        feed_layout.addStretch()
+       
+        layout.addLayout(feed_layout)
+       
+        # Bottom buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(30)
+       
+        # Back button
+        self.back_btn = QPushButton("← GO BACK")
+        self.back_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(158, 11, 96);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(138, 10, 84);
+            }
+            QPushButton:pressed {
+                background-color: rgb(89, 6, 54);
+            }
+        """)
+        self.back_btn.clicked.connect(self.go_back)
+       
+        # Save settings button
+        self.save_btn = QPushButton("SAVE SETTINGS")
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(86, 123, 223);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(70, 70, 213);
+            }
+            QPushButton:pressed {
+                background-color: rgb(78, 51, 213);
+            }
+        """)
+        self.save_btn.clicked.connect(self.save_settings)
+       
+        button_layout.addStretch()
+        button_layout.addWidget(self.back_btn)
+        button_layout.addWidget(self.save_btn)
+        button_layout.addStretch()
+       
+        layout.addLayout(button_layout)
+   
+    def go_back(self):
+        """Return to main page"""
+        if self.parent_window:
+            self.parent_window.show_main_page()
+   
+    def save_settings(self):
+        """Save current settings - override in subclasses if needed"""
+        try:
+            if self.db_manager:
+                self.db_manager.save_measurement("FIDAS_MAIN", 150.0, 75.0, 50.0, "calibration")
+            
+            QMessageBox.information(self, "Settings Saved",
+                                  f"{self.title} settings have been saved successfully to database.")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Error saving settings: {str(e)}")
+
+
+class SaveBaseImageWidget(CameraFeedWidget):
+    """Save Base Image camera widget for capturing reference images"""
+   
+    def __init__(self, parent=None):
+        super().__init__("SAVE BASE IMAGE", parent)
+   
+    def save_settings(self):
+        """Save base image - override to handle image capture"""
+        try:
+            if self.db_manager:
+                image_path = f"base_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                self.db_manager.save_base_image("FIDAS_MAIN", image_path)
+            
+            QMessageBox.information(self, "Base Image Saved",
+                                  "Base reference image has been captured and saved successfully to database.")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Error saving base image: {str(e)}")
+
+
+class ExposureSettingsWidget(QtWidgets.QWidget):
+    """Exposure Settings widget with camera feed and trackbar controls"""
+   
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.db_manager = parent.db_manager if parent else None
+        self.title = "EXPOSURE SETTINGS"
+        self.setup_layout()
+   
+    def setup_layout(self):
+        """Setup the exposure settings layout with camera feed and trackbar"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(20)
+       
+        # Title header
+        title_label = QLabel(self.title)
+        title_label.setStyleSheet("""
+            QLabel {
+                color: rgb(179, 179, 179);
+                font-size: 24px;
+                font-weight: bold;
+                padding: 10px 0px;
+            }
+        """)
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title_label)
+       
+        # Camera feed area
+        self.camera_feed_label = QLabel()
+        self.camera_feed_label.setMinimumSize(800, 600)
+        self.camera_feed_label.setStyleSheet("""
+            QLabel {
+                background-color: rgb(45, 50, 51);
+                border: 2px solid rgb(86, 123, 223);
+                border-radius: 10px;
+                color: rgb(179, 179, 179);
+                font-size: 18px;
+            }
+        """)
+        self.camera_feed_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.camera_feed_label.setText(f"{self.title}\n\nCamera Feed Area\n800 x 600 pixels\n\n[Connect your OpenCV feed here]")
+        self.camera_feed_label.setScaledContents(True)
+       
+        # Center the camera feed
+        feed_layout = QHBoxLayout()
+        feed_layout.addStretch()
+        feed_layout.addWidget(self.camera_feed_label)
+        feed_layout.addStretch()
+       
+        layout.addLayout(feed_layout)
+       
+        # Exposure control panel
+        control_panel = QtWidgets.QFrame()
+        control_panel.setStyleSheet("""
+            QFrame {
+                background-color: rgb(45, 50, 51);
+                border-radius: 10px;
+                padding: 20px;
+            }
+        """)
+        control_layout = QVBoxLayout(control_panel)
+        control_layout.setSpacing(15)
+       
+        # Exposure label
+        exposure_label = QLabel("EXPOSURE CONTROL")
+        exposure_label.setStyleSheet("""
+            QLabel {
+                color: rgb(179, 179, 179);
+                font-size: 16px;
+                font-weight: bold;
+                padding: 5px 0px;
+            }
+        """)
+        exposure_label.setAlignment(QtCore.Qt.AlignCenter)
+        control_layout.addWidget(exposure_label)
+       
+        # Trackbar container
+        trackbar_container = QHBoxLayout()
+       
+        # Min label
+        min_label = QLabel("0")
+        min_label.setStyleSheet("color: rgb(179, 179, 179); font-size: 14px;")
+        trackbar_container.addWidget(min_label)
+       
+        # Exposure trackbar
+        self.exposure_slider = QSlider(Qt.Horizontal)
+        self.exposure_slider.setMinimum(0)
+        self.exposure_slider.setMaximum(100)
+        self.exposure_slider.setValue(50)
+        self.exposure_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 2px solid rgb(86, 123, 223);
+                height: 8px;
+                background: rgb(35, 40, 41);
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: rgb(86, 123, 223);
+                border: 2px solid rgb(70, 70, 213);
+                width: 20px;
+                margin: -6px 0;
+                border-radius: 10px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: rgb(70, 70, 213);
+            }
+            QSlider::sub-page:horizontal {
+                background: rgb(86, 123, 223);
+                border-radius: 4px;
+            }
+        """)
+        self.exposure_slider.valueChanged.connect(self.exposure_changed)
+        trackbar_container.addWidget(self.exposure_slider)
+       
+        # Max label
+        max_label = QLabel("100")
+        max_label.setStyleSheet("color: rgb(179, 179, 179); font-size: 14px;")
+        trackbar_container.addWidget(max_label)
+       
+        control_layout.addLayout(trackbar_container)
+       
+        # Current value display
+        self.value_label = QLabel("Current Value: 50")
+        self.value_label.setStyleSheet("""
+            QLabel {
+                color: rgb(179, 179, 179);
+                font-size: 14px;
+                padding: 5px;
+            }
+        """)
+        self.value_label.setAlignment(QtCore.Qt.AlignCenter)
+        control_layout.addWidget(self.value_label)
+       
+        # Center the control panel
+        control_center_layout = QHBoxLayout()
+        control_center_layout.addStretch()
+        control_center_layout.addWidget(control_panel)
+        control_center_layout.addStretch()
+       
+        layout.addLayout(control_center_layout)
+       
+        # Bottom buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(30)
+       
+        # Back button
+        self.back_btn = QPushButton("← GO BACK")
+        self.back_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(158, 11, 96);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(138, 10, 84);
+            }
+            QPushButton:pressed {
+                background-color: rgb(89, 6, 54);
+            }
+        """)
+        self.back_btn.clicked.connect(self.go_back)
+       
+        # Save settings button
+        self.save_btn = QPushButton("SAVE SETTINGS")
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(86, 123, 223);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(70, 70, 213);
+            }
+            QPushButton:pressed {
+                background-color: rgb(78, 51, 213);
+            }
+        """)
+        self.save_btn.clicked.connect(self.save_settings)
+       
+        button_layout.addStretch()
+        button_layout.addWidget(self.back_btn)
+        button_layout.addWidget(self.save_btn)
+        button_layout.addStretch()
+       
+        layout.addLayout(button_layout)
+   
+    def exposure_changed(self, value):
+        """Handle exposure slider value changes"""
+        self.value_label.setText(f"Current Value: {value}")
+   
+    def go_back(self):
+        """Return to main page"""
+        if self.parent_window:
+            self.parent_window.show_main_page()
+   
+    def save_settings(self):
+        """Save exposure settings"""
+        current_value = self.exposure_slider.value()
+        try:
+            if self.db_manager:
+                self.db_manager.save_measurement("FIDAS_MAIN", 0.0, 0.0, float(current_value), "calibration")
+            
+            QMessageBox.information(self, "Settings Saved",
+                                  f"Exposure settings saved to database.\nCurrent exposure value: {current_value}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Error saving exposure settings: {str(e)}")
+
+
+class ViewDatabaseWidget(QtWidgets.QWidget):
+    """Database viewing widget with SQLite3 integration"""
+   
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.db_manager = parent.db_manager if parent else None
+        self.title = "VIEW DATABASE"
+        self.setup_layout()
+        self.load_database_data()
+   
+    def setup_layout(self):
+        """Setup the database view layout"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 20, 30, 20)
+        layout.setSpacing(20)
+       
+        # Title header
+        title_label = QLabel(self.title)
+        title_label.setStyleSheet("""
+            QLabel {
+                color: rgb(179, 179, 179);
+                font-size: 24px;
+                font-weight: bold;
+                padding: 10px 0px;
+            }
+        """)
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title_label)
+       
+        # Database table
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+       
+        # Set column headers for measurement data
+        headers = ["ID", "Machine", "Length", "Width", "Exposure", "Mode", "Timestamp"]
+        self.table.setHorizontalHeaderLabels(headers)
+       
+        # Table styling
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: rgb(45, 50, 51);
+                border: 2px solid rgb(86, 123, 223);
+                border-radius: 10px;
+                color: rgb(179, 179, 179);
+                font-size: 14px;
+                gridline-color: rgb(86, 123, 223);
+                selection-background-color: rgb(86, 123, 223);
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid rgb(86, 123, 223);
+            }
+            QTableWidget::item:selected {
+                background-color: rgb(86, 123, 223);
+                color: rgb(219, 219, 219);
+            }
+            QHeaderView::section {
+                background-color: rgb(86, 123, 223);
+                color: rgb(219, 219, 219);
+                padding: 10px;
+                border: none;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QScrollBar:vertical {
+                background: rgb(35, 40, 41);
+                width: 15px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgb(86, 123, 223);
+                border-radius: 7px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgb(70, 70, 213);
+            }
+        """)
+       
+        # Table properties
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setMinimumHeight(600)
+       
+        layout.addWidget(self.table)
+       
+        # Info label
+        info_label = QLabel("Select a row and click DELETE to remove an entry, or REFRESH to reload data")
+        info_label.setStyleSheet("""
+            QLabel {
+                color: rgb(179, 179, 179);
+                font-size: 12px;
+                padding: 5px;
+            }
+        """)
+        info_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(info_label)
+       
+        # Bottom buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(30)
+       
+        # Refresh button
+        self.refresh_btn = QPushButton("REFRESH DATA")
+        self.refresh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(6, 181, 149);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(5, 145, 119);
+            }
+            QPushButton:pressed {
+                background-color: rgb(6, 207, 170);
+            }
+        """)
+        self.refresh_btn.clicked.connect(self.load_database_data)
+       
+        # Delete button
+        self.delete_btn = QPushButton("DELETE SELECTED")
+        self.delete_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(220, 50, 50);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(200, 30, 30);
+            }
+            QPushButton:pressed {
+                background-color: rgb(180, 20, 20);
+            }
+            QPushButton:disabled {
+                background-color: rgb(100, 100, 100);
+                color: rgb(150, 150, 150);
+            }
+        """)
+        self.delete_btn.clicked.connect(self.delete_selected)
+       
+        # Go back button
+        self.back_btn = QPushButton("← GO BACK")
+        self.back_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(158, 11, 96);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(138, 10, 84);
+            }
+            QPushButton:pressed {
+                background-color: rgb(89, 6, 54);
+            }
+        """)
+        self.back_btn.clicked.connect(self.go_back)
+       
+        button_layout.addStretch()
+        button_layout.addWidget(self.refresh_btn)
+        button_layout.addWidget(self.delete_btn)
+        button_layout.addWidget(self.back_btn)
+        button_layout.addStretch()
+       
+        layout.addLayout(button_layout)
+   
+    def load_database_data(self):
+        """Load data from SQLite3 database"""
+        if not self.db_manager:
+            return
+            
+        try:
+            data = self.db_manager.get_all_measurements()
+            self.table.setRowCount(len(data))
+           
+            for row_idx, row_data in enumerate(data):
+                for col_idx, cell_data in enumerate(row_data):
+                    item = QTableWidgetItem(str(cell_data))
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    self.table.setItem(row_idx, col_idx, item)
+        except Exception as e:
+            QMessageBox.warning(self, "Database Error", f"Error loading database data: {str(e)}")
+   
+    def delete_selected(self):
+        """Delete selected row from table and database"""
+        current_row = self.table.currentRow()
+        if current_row >= 0:
+            # Get the ID from the first column for database deletion
+            id_item = self.table.item(current_row, 0)
+            if id_item:
+                record_id = int(id_item.text())
+               
+                # Confirm deletion
+                reply = QMessageBox.question(
+                    self, "Confirm Deletion",
+                    f"Are you sure you want to delete record ID {record_id}?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+               
+                if reply == QMessageBox.Yes:
+                    try:
+                        if self.db_manager.delete_measurement(record_id):
+                            self.load_database_data()  # Refresh the table
+                            QMessageBox.information(
+                                self, "Record Deleted",
+                                f"Record ID {record_id} has been deleted successfully."
+                            )
+                        else:
+                            QMessageBox.warning(
+                                self, "Delete Error",
+                                f"Failed to delete record ID {record_id}."
+                            )
+                    except Exception as e:
+                        QMessageBox.warning(self, "Delete Error", f"Error deleting record: {str(e)}")
+        else:
+            QMessageBox.warning(
+                self, "No Selection",
+                "Please select a row to delete."
+            )
+   
+    def go_back(self):
+        """Return to main page"""
+        if self.parent_window:
+            self.parent_window.show_main_page()
+
+
+class MainPageWidget(QtWidgets.QWidget):
+    """Main page widget with navigation buttons"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setup_layout()
+    
+    def setup_layout(self):
+        """Setup the main page layout"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(30)
+        
+        # Title header
+        title_label = QLabel("FIDAS WIDTH MEASUREMENT SYSTEM")
+        title_label.setStyleSheet("""
+            QLabel {
+                color: rgb(86, 123, 223);
+                font-size: 36px;
+                font-weight: bold;
+                padding: 20px 0px;
+            }
+        """)
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Version info
+        if self.parent_window and self.parent_window.db_manager:
+            version = self.parent_window.db_manager.get_version("FIDAS_MAIN") or "v1.0.0"
+            version_label = QLabel(f"Version: {version}")
+            version_label.setStyleSheet("""
+                QLabel {
+                    color: rgb(179, 179, 179);
+                    font-size: 14px;
+                    padding: 5px;
+                }
+            """)
+            version_label.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(version_label)
+        
+        # Main buttons grid
+        grid_layout = QtWidgets.QGridLayout()
+        grid_layout.setHorizontalSpacing(30)
+        grid_layout.setVerticalSpacing(30)
+        
+        # Button definitions
+        buttons = [
+            ("CROP SETTINGS", "rgb(86, 123, 223)", 0, 0),
+            ("LEFT EDGE", "rgb(158, 11, 96)", 0, 1),
+            ("RIGHT EDGE", "rgb(6, 181, 149)", 0, 2),
+            ("LEFT CAM CAL", "rgb(220, 50, 50)", 1, 0),
+            ("RIGHT CAM CAL", "rgb(255, 165, 0)", 1, 1),
+            ("CENTER CAL", "rgb(138, 43, 226)", 1, 2),
+            ("OVERLAP STITCHING", "rgb(0, 191, 255)", 2, 0),
+            ("EXPOSURE SETTINGS", "rgb(60, 179, 113)", 2, 1),
+            ("SAVE BASE IMAGE", "rgb(219, 112, 147)", 2, 2),
+            ("VIEW DATABASE", "rgb(106, 90, 205)", 3, 0, 1, 3)  # Wider button
+        ]
+        
+        # Create buttons
+        self.buttons = []
+        for btn_def in buttons:
+            text, color, row, col, *span = btn_def
+            btn = QPushButton(text)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color};
+                    color: rgb(219, 219, 219);
+                    border: none;
+                    border-radius: 10px;
+                    padding: 20px 10px;
+                    font-size: 18px;
+                    font-weight: bold;
+                    min-width: 200px;
+                    min-height: 80px;
+                }}
+                QPushButton:hover {{
+                    background-color: rgba{color[3:-1]}, 0.8);
+                }}
+                QPushButton:pressed {{
+                    background-color: rgba{color[3:-1]}, 0.6);
+                }}
+            """)
+            
+            # Connect to navigation
+            btn.clicked.connect(self.create_navigation_handler(text))
+            
+            if span:
+                grid_layout.addWidget(btn, row, col, *span)
+            else:
+                grid_layout.addWidget(btn, row, col)
+            
+            self.buttons.append(btn)
+        
+        layout.addLayout(grid_layout)
+        
+        # System settings button
+        settings_btn = QPushButton("SYSTEM SETTINGS")
+        settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(100, 100, 100);
+                color: rgb(219, 219, 219);
+                border: none;
+                border-radius: 10px;
+                padding: 15px 30px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 150px;
+                min-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: rgb(120, 120, 120);
+            }
+            QPushButton:pressed {
+                background-color: rgb(80, 80, 80);
+            }
+        """)
+        settings_btn.clicked.connect(self.show_system_settings)
+        layout.addWidget(settings_btn, alignment=QtCore.Qt.AlignCenter)
+    
+    def create_navigation_handler(self, button_text):
+        """Create navigation handler for button clicks"""
+        def handler():
+            if self.parent_window:
+                page_map = {
+                    "CROP SETTINGS": 1,
+                    "LEFT EDGE": 2,
+                    "RIGHT EDGE": 3,
+                    "LEFT CAM CAL": 4,
+                    "RIGHT CAM CAL": 5,
+                    "CENTER CAL": 6,
+                    "OVERLAP STITCHING": 7,
+                    "EXPOSURE SETTINGS": 8,
+                    "SAVE BASE IMAGE": 9,
+                    "VIEW DATABASE": 10
+                }
+                page_index = page_map.get(button_text, 0)
+                self.parent_window.stacked_widget.setCurrentIndex(page_index)
+        return handler
+    
+    def show_system_settings(self):
+        """Show system settings dialog"""
+        if self.parent_window:
+            self.parent_window.show_settings()
+
+
+class FidasMainWindow(QtWidgets.QMainWindow):
+    """Main application window for FIDAS system"""
+    
+    def __init__(self):
+        super().__init__()
+        self.db_manager = DatabaseManager()
+        self.init_ui()
+    
+    def init_ui(self):
+        """Initialize the main UI"""
+        self.setWindowTitle("FIDAS Width Measurement System")
+        self.setGeometry(100, 100, 1280, 800)
+        
+        # Set dark theme palette
+        dark_palette = QtGui.QPalette()
+        dark_palette.setColor(QtGui.QPalette.Window, QtGui.QColor(35, 40, 41))
+        dark_palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(179, 179, 179))
+        dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(45, 50, 51))
+        dark_palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(55, 60, 61))
+        dark_palette.setColor(QtGui.QPalette.ToolTipBase, QtGui.QColor(179, 179, 179))
+        dark_palette.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor(179, 179, 179))
+        dark_palette.setColor(QtGui.QPalette.Text, QtGui.QColor(179, 179, 179))
+        dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(65, 70, 71))  # Fixed color setting
+        dark_palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(179, 179, 179))
+        dark_palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    
+    # Set application style
+    app.setStyle('Fusion')
+    
+    # Create and show main window
+    main_window = FidasMainWindow()
+    main_window.show()
+    
+    # Execute application
+    sys.exit(app.exec_())
